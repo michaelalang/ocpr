@@ -1,0 +1,75 @@
+#!/usr/bin/python
+
+import requests
+from bs4 import BeautifulSoup
+import sys
+import os
+import optparse
+from concurrent.futures import ThreadPoolExecutor, wait
+from hashlib import md5
+import re
+
+BASEURI = 'https://mirror.openshift.com/pub/openshift-v4/clients/ocp/'
+
+def get_cache(uri):
+    hexd = md5(uri.encode('utf8')).hexdigest()
+    if os.path.isfile(f".ocpr/{hexd}"):
+        return open(f".ocpr/{hexd}").read()
+    return ""
+
+def put_cache(uri, content):
+    hexd = md5(uri.encode('utf8')).hexdigest()
+    if not os.path.isfile(f".ocpr/{hexd}"):
+        open(f".ocpr/{hexd}", 'w').write(content)
+
+def get_releasenotes(uri):
+    try:
+        content = get_cache(uri)
+        if content == "": 
+            rsp = requests.get(uri)
+            if rsp.status_code in (200, 404):
+                put_cache(uri, rsp.text)
+                content = rsp.text
+        clog = BeautifulSoup(content, 'lxml')
+    except Exception as e:
+        return False
+    return clog
+
+def get_versions(uri):
+    clog = get_releasenotes(uri)
+    return sorted(map(lambda x: x.text.strip(), clog.findAll(name='a')))
+
+def get_fixes(clog):
+    return list(filter(
+            lambda x: not 'Full changelog' == x.text, 
+            clog.findAll(name='li')))
+
+def check_fix(version, search):
+    global output
+    fixes = get_fixes(get_releasenotes(f"{BASEURI}{version}/changelog.html"))
+    try:    fix = list(filter(lambda x: search.search(x.text), fixes))[0]
+    except: fix = False
+    if fix:
+        output.append(f"{version} Found: {fix.text}")
+
+if __name__ == '__main__':
+    parser = optparse.OptionParser()
+    parser.add_option('-v', '--version', action='store', default='4.12')
+    parser.add_option('-c', '--channel', action='store', default='stable')
+    parser.add_option('-s', '--search', action='store', default='.')
+    parser.add_option('--which', action='store_true', default=False)
+    options, remainings = parser.parse_args()
+
+    output = []
+    smatch = re.compile(options.search, re.I)
+    if not os.path.isdir('.ocpr'):  os.mkdir('.ocpr')
+    check_fix(f"{options.channel}-{options.version}", smatch)
+    if options.which:
+        threads = []
+        versions = list(filter(lambda x: all([x.startswith(options.version),
+                                              '-rc.' not in x]), get_versions(BASEURI)))
+        with ThreadPoolExecutor(max_workers=len(versions)) as tpe:
+            for version in versions:
+                threads.append(tpe.submit(check_fix, version, smatch))
+        wait(threads) 
+    print('\n'.join(sorted(output)))
