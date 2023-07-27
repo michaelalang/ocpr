@@ -1,0 +1,97 @@
+#!/usr/bin/python -Wignore
+
+import requests
+from bs4 import BeautifulSoup
+from collections import defaultdict
+import sys
+import os
+import optparse
+from concurrent.futures import ThreadPoolExecutor, wait
+from packaging import version as pkgversion
+from hashlib import md5
+import json
+import re
+
+BASEURI = 'https://mirror.openshift.com/pub/openshift-v4/clients/ocp/'
+ISSUESRE = re.compile('^[A-Z]+\-\d+\:')
+
+def get_cache(uri):
+    hexd = md5(uri.encode('utf8')).hexdigest()
+    if os.path.isfile(f".ocpr/{hexd}"):
+        return open(f".ocpr/{hexd}").read()
+    return ""
+
+def put_cache(uri, content):
+    hexd = md5(uri.encode('utf8')).hexdigest()
+    if not os.path.isfile(f".ocpr/{hexd}"):
+        open(f".ocpr/{hexd}", 'w').write(content)
+
+def get_releasenotes(uri):
+    try:
+        content = get_cache(uri)
+        if content == "":
+            rsp = requests.get(uri)
+            if rsp.status_code in (200, 404):
+                put_cache(uri, rsp.text)
+                content = rsp.text
+        clog = BeautifulSoup(content, 'lxml')
+    except Exception as e:
+        return False
+    return clog
+
+def get_versions(uri):
+    clog = get_releasenotes(uri)
+    versions = []
+    for vers in sorted(map(lambda x: x.text.strip(), clog.findAll(name='a'))):
+        try:    versions.append(pkgversion.parse(vers))
+        except: pass
+    return sorted(versions)
+
+def get_fixes(clog):
+    return list(filter(
+            lambda x: not 'Full changelog' == x.text,
+            clog.findAll(name='li')))
+
+def get_upgrade_list(version, issues=False, jsonout=False):
+    global output, seen
+    fixes = get_fixes(get_releasenotes(f"{BASEURI}{version}/changelog.html"))
+    for fix in fixes:
+        if issues:
+            if not ISSUESRE.match(fix.text.strip()):
+                continue
+        if fix.text.strip() in seen: continue
+        seen.add(fix.text.strip())
+        output[str(version)].append(fix.text.strip().replace('\n', ''))
+
+if __name__ == "__main__":
+    parser = optparse.OptionParser()
+    parser.add_option('-f', '--from', dest='vfrom', action='store', default=None)
+    parser.add_option('-t', '--to', dest='vto', action='store', default=None)
+    parser.add_option('-c', '--channel', action='store', default='stable')
+    parser.add_option('-i', '--issues', action='store_true', default=False)
+    parser.add_option('-j', '--json', action='store_true', default=False)
+    options, remainings = parser.parse_args()
+
+    output = defaultdict(list)
+    seen = set([])
+    
+    vfrom = pkgversion.parse(options.vfrom)
+    vto   = pkgversion.parse(options.vto)
+    if vto.micro == 0:
+        fixes = filter(lambda vers: all([
+                          vers.minor <= vto.minor, 
+                          vers <= pkgversion.parse(f"{vto.major}.{vto.minor+1}"),
+                          vers >= vfrom]),
+                          get_versions(BASEURI))
+    else:
+        fixes = filter(lambda vers: all([
+                          vers >= vfrom,
+                          vers <= vto]),
+                          get_versions(BASEURI))
+    for version in fixes:
+        get_upgrade_list(version, options.issues)
+    for version in sorted(map(lambda x: pkgversion.parse(x), output.keys())):
+        print('#' * 80)
+        print(f"{version}:")
+        print('\t%s' % '\n\t'.join(sorted(output[str(version)])))
+        print
